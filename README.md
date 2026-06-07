@@ -8,15 +8,14 @@
 
 ## 👥 Equipe
 
-| Nome |
-|------|
-| Paloma Dias de Carvalho |
-| Arthur Luiz Alves Soares |
-| Athos Marques Ribeiro Fonseca |
-| Brenda Evers |
-| Mateus Araujo Santos |
+Arthur Luiz Alves Soares
+Athos Marques Ribeiro Fonseca
+Brenda Evers
+Mateus Araujo Santos
+Paloma Dias de Carvalho
 
 **Professor:** Filipe Tório Lopes Ruas Nhimi
+
 **Disciplina:** Arquitetura de Software — 5º Período
 
 ---
