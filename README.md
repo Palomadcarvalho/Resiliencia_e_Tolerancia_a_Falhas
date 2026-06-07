@@ -34,42 +34,42 @@ O foco principal não é apenas capturar erros, mas aplicar **estratégias arqui
 
 ## 🎯 Cenário
 
-A aplicação simula uma **API acadêmica** que depende de serviços externos, como:
-
-- Consulta de endereço por CEP
-- Envio de e-mail
-- Processamento de pagamento
-- Autenticação de usuários
-- Validação de CPF
-- Integração com sistemas externos
-
-Esses serviços podem **falhar**, **demorar a responder** ou ficar **temporariamente indisponíveis**. Os mecanismos implementados visam reduzir o impacto dessas falhas sobre a aplicação principal.
+A aplicação simula uma **API acadêmica de matrícula** que depende de um serviço externo de **validação de CPF**. Esse serviço pode falhar, demorar a responder ou ficar temporariamente indisponível. Os mecanismos implementados visam reduzir o impacto dessas falhas sobre a aplicação principal, garantindo que o usuário sempre receba uma resposta controlada.
 
 ---
 
 ## ⚙️ Mecanismos de Resiliência Implementados
 
-Os mecanismos abaixo foram implementados conforme os requisitos do trabalho:
+### 🔒 Bulkhead
+Limita a **10 o número máximo de requisições simultâneas** ao serviço externo usando `asyncio.Semaphore`. Requisições além do limite recebem HTTP 429 imediatamente, evitando que um pico de tráfego consuma todos os recursos do servidor.
+
+**Trade-offs:** Limite muito baixo pode rejeitar requisições legítimas; requer ajuste baseado em teste de carga.
 
 ### 🔁 Retry
-Reenvio automático de requisições em caso de falha temporária, com controle de número de tentativas e intervalo entre elas.
+Reenvio automático com **backoff exponencial** (1s → 2s → 4s) usando a biblioteca `tenacity`. Realiza até 3 tentativas antes de desistir, e apenas para exceções elegíveis (timeout e erros HTTP 5xx).
 
-**Trade-offs:** Aumenta a latência total em caso de falhas consecutivas; pode sobrecarregar um serviço já instável.
+**Trade-offs:** Aumenta a latência total em caso de falhas consecutivas; deve ser usado apenas em operações idempotentes (leitura/consulta).
 
 ### ⏱️ Timeout
-Limite de tempo para aguardar a resposta de um serviço externo. Se o tempo for excedido, a operação é cancelada e tratada como falha.
+Limite de **5 segundos por tentativa** configurado via `httpx`. Se o serviço externo não responder nesse tempo, a operação é cancelada e o retry é acionado.
 
-**Trade-offs:** Um timeout muito curto pode descartar respostas válidas; muito longo impacta a experiência do usuário.
+**Trade-offs:** Timeout muito curto descarta respostas válidas em serviços naturalmente lentos; muito longo torna o circuit breaker ineficaz.
 
 ### 🔀 Fallback
-Resposta alternativa (padrão ou cache) fornecida ao usuário quando o serviço principal não está disponível, garantindo degradação controlada.
+Quando todas as tentativas de retry falham, a API retorna **HTTP 200 com status `matricula_pendente`**, informando que a validação do CPF será realizada posteriormente. O usuário nunca recebe um erro 500 bruto.
 
-**Trade-offs:** O dado de fallback pode estar desatualizado; o usuário pode não perceber que está recebendo uma resposta alternativa.
+**Trade-offs:** Exige um mecanismo complementar (fila, job agendado) para processar as pendências; a resposta deve ser honesta sobre o estado real.
 
 ### 🔌 Circuit Breaker
-Interrompe automaticamente as chamadas ao serviço externo após um número de falhas consecutivas, evitando sobrecarga. Após um período de espera, tenta restabelecer a conexão.
+Implementado com `pybreaker`, opera em **três estados**:
+- **CLOSED:** operação normal — chamadas passam normalmente.
+- **OPEN:** após 5 falhas consecutivas — chamadas bloqueadas, fallback imediato.
+- **HALF-OPEN:** após 30 segundos — uma chamada de teste é permitida para verificar recuperação.
 
-**Trade-offs:** Pode rejeitar requisições mesmo quando o serviço já se recuperou; requer ajuste fino dos limiares.
+**Trade-offs:** Estado em memória não é compartilhado entre múltiplas instâncias (para produção, usar Redis); requer ajuste fino dos limiares de abertura.
+
+### ❤️ Health Check
+O endpoint `/health` consulta ativamente o serviço externo e retorna o estado atual do circuit breaker, permitindo visibilidade proativa do sistema.
 
 ---
 
@@ -77,27 +77,24 @@ Interrompe automaticamente as chamadas ao serviço externo após um número de f
 
 ### Pré-requisitos
 
-- [PREENCHER]
+- [Docker Desktop](https://docs.docker.com/get-docker/) instalado (inclui Docker Compose)
 
 ### Instalação
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seu-usuario/seu-repositorio.git
+git clone https://github.com/Palomadcarvalho/Resiliencia_e_Tolerancia_a_Falhas/
 cd seu-repositorio
-
-# Instale as dependências
-[comando de instalação]
 ```
 
 ### Execução
 
 ```bash
-# Suba os serviços
-[comando para iniciar a aplicação]
-
-# Exemplo: com Docker Compose
+# Suba todos os serviços (API, serviço externo, Prometheus e Grafana)
 docker-compose up --build
+
+# Para encerrar
+docker-compose down
 ```
 
 ---
@@ -108,40 +105,100 @@ As seguintes situações podem ser simuladas para demonstrar o comportamento res
 
 | Cenário | Como simular | Comportamento esperado |
 |--------|--------------|------------------------|
-| ✅ Chamada bem-sucedida | Requisição normal | Resposta 200 com dados do serviço |
-| 🐢 Lentidão | [descrever forma de simular] | Timeout acionado após X segundos |
-| ❌ Falha total | [descrever forma de simular] | Retry + Fallback ou Circuit Breaker |
-| 🔁 Retry | Falha intermitente | N tentativas antes de desistir |
-| 🔌 Circuit Breaker aberto | Falhas consecutivas | Requisições rejeitadas sem chamar o serviço |
+| ✅ Chamada bem-sucedida | `POST /matricula/{cpf}?modo=sucesso` | HTTP 200 com resultado da validação |
+| 🐢 Lentidão | `POST /matricula/{cpf}?modo=lento` | Timeout (5s) → Retry 3x com backoff → Fallback |
+| ❌ Falha total | `POST /matricula/{cpf}?modo=falha` | Retry 3x → Fallback com matrícula pendente |
+| 🔁 Retry | Qualquer `modo=falha` ou `modo=lento` | Logs evidenciam 3 tentativas com intervalos crescentes |
+| 🔌 Circuit Breaker aberto | 5+ chamadas com `modo=falha` | Requisições bloqueadas sem chamar o serviço (HTTP 503) |
+| 🔒 Bulkhead | 10+ requisições simultâneas | Excedente recebe HTTP 429 imediatamente |
+
+### Comandos de teste prontos
+
+```bash
+# 1. Chamada bem-sucedida
+curl -X POST "http://localhost:8000/matricula/529.982.247-25?modo=sucesso"
+
+# 2. Simular lentidão
+curl -X POST "http://localhost:8000/matricula/529.982.247-25?modo=lento"
+
+# 3. Simular falha (execute 5+ vezes para abrir o circuit breaker)
+curl -X POST "http://localhost:8000/matricula/529.982.247-25?modo=falha"
+
+# 4. Ver estado do circuit breaker
+curl http://localhost:8000/circuit-breaker/status
+
+# 5. Resetar o circuit breaker
+curl -X POST http://localhost:8000/circuit-breaker/resetar
+
+# 6. Health check detalhado
+curl http://localhost:8000/health
+```
 
 ---
 
 ## 📊 Métricas e Logs
 
-Os logs e métricas da aplicação evidenciam o comportamento resiliente em cada cenário. Para visualizá-los:
+Os logs estruturados e as métricas evidenciam o comportamento resiliente em cada cenário.
 
 ```bash
-# Exemplo: visualizar logs em tempo real
-[comando para acessar logs]
+# Visualizar logs em tempo real de todos os serviços
+docker-compose logs -f
 
-# Exemplo: acessar dashboard de métricas
-[URL do Grafana, Prometheus, etc.]
+# Visualizar logs apenas da API principal
+docker-compose logs -f api-principal
 ```
+
+**Dashboards de monitoramento:**
+- **Prometheus:** http://localhost:9090
+- **Grafana:** http://localhost:3000 (usuário: `admin` | senha: `admin`)
+
+| Métrica | Descrição |
+|--------|-----------|
+| `matricula_requisicoes_total{status}` | Total por status: `sucesso`, `fallback`, `circuit_breaker`, `bulkhead_rejeitado` |
+| `matricula_retry_total` | Total de retries realizados |
+| `matricula_circuit_breaker_aberto_total` | Vezes que o circuit breaker abriu |
+| `matricula_duracao_segundos` | Histograma de latência das requisições |
 
 ---
 
 ## 🏗️ Arquitetura
 
 ```
-[Adicionar diagrama de arquitetura da solução]
+Cliente (curl / Postman)
+         │
+         ▼ HTTP POST /matricula/{cpf}?modo=sucesso|lento|falha
+         │
+┌────────────────────────────────────────────┐
+│          API Principal (porta 8000)         │
+│                                            │
+│  1. Bulkhead    → máx. 10 simultâneas      │
+│  2. Circuit Breaker → CLOSED/OPEN/HALF-OPEN│
+│  3. Timeout     → 5s por tentativa         │
+│  4. Retry       → 3x, backoff 1s→2s→4s    │
+│  5. Fallback    → matrícula pendente       │
+└───────────────────┬────────────────────────┘
+                    │ HTTP GET
+                    ▼
+┌────────────────────────────────────────────┐
+│     Serviço Externo Simulado (porta 8001)   │
+│                                            │
+│  /validar-cpf/sucesso  → resposta normal   │
+│  /validar-cpf/lento    → delay 10s         │
+│  /validar-cpf/falha    → HTTP 500          │
+└────────────────────────────────────────────┘
+         │
+         ▼ scrape /metrics
+┌─────────────────┐      ┌─────────────────┐
+│   Prometheus    │ ───► │     Grafana      │
+│  (porta 9090)   │      │  (porta 3000)   │
+└─────────────────┘      └─────────────────┘
 ```
 
 **Tecnologias utilizadas:**
-- **Back-end:** [ex: Node.js / Java / Python / Go]
-- **Resiliência:** [ex: Resilience4J / Polly / Hystrix / Spring Retry]
-- **Monitoramento:** [ex: Prometheus / Grafana / OpenTelemetry]
-- **Infraestrutura:** [ex: Docker / Docker Compose]
-- **Banco de dados:** [ex: PostgreSQL / MongoDB / Redis]
+- **Back-end:** Python 3.11 + FastAPI + Uvicorn
+- **Resiliência:** pybreaker (Circuit Breaker) · tenacity (Retry) · httpx (Timeout) · asyncio.Semaphore (Bulkhead)
+- **Monitoramento:** Prometheus + Grafana + prometheus-client
+- **Infraestrutura:** Docker + Docker Compose
 
 ---
 
@@ -149,27 +206,36 @@ Os logs e métricas da aplicação evidenciam o comportamento resiliente em cada
 
 ### Por que escolhemos essas estratégias?
 
-[Descrever aqui as justificativas para as escolhas feitas, os trade-offs considerados e como cada mecanismo contribui para a resiliência geral do sistema.]
+A combinação dos mecanismos forma uma **defesa em profundidade**: cada camada cobre a limitação da anterior. Nenhum mecanismo isolado é suficiente — um retry sem fallback ainda expõe erro ao usuário; um fallback sem circuit breaker ainda desperdiça recursos tentando um serviço sabidamente indisponível.
+
+A escolha do Python com FastAPI se justifica pela simplicidade de demonstração e pela disponibilidade de bibliotecas maduras (`pybreaker`, `tenacity`) que implementam os padrões corretamente, sem reinventar a roda.
 
 ### Impactos arquiteturais
 
-- **Retry + Timeout:** Trabalham em conjunto para equilibrar persistência e responsividade.
-- **Fallback + Circuit Breaker:** Garantem degradação controlada e proteção contra cascata de falhas.
-- **Health Check:** Permite visibilidade proativa do estado dos serviços.
+- **Retry + Timeout:** Trabalham em conjunto — o timeout define quando uma tentativa falha; o retry decide se vale tentar novamente. O backoff exponencial evita sobrecarregar um serviço já degradado.
+- **Fallback + Circuit Breaker:** Garantem degradação controlada. O circuit breaker elimina a latência de timeout × retries quando o serviço está claramente indisponível, tornando o fallback imediato.
+- **Bulkhead:** Isola o impacto de picos de tráfego, garantindo que um volume anormal de requisições não degrade toda a aplicação.
+- **Health Check:** Permite visibilidade proativa — a equipe de operações sabe o estado do sistema antes que os usuários percebam a degradação.
 
 ---
 
 ## 📁 Estrutura do Projeto
 
 ```
-📦 projeto
- ┣ 📂 src/
- ┃ ┣ 📂 api/
- ┃ ┣ 📂 services/
- ┃ ┣ 📂 resilience/
- ┃ ┗ 📂 config/
- ┣ 📂 tests/
- ┣ 📂 docs/
+📦 projeto-resiliencia
+ ┣ 📂 api-principal/
+ ┃ ┣ 📄 main.py            ← Bulkhead + CB + Retry + Timeout + Fallback
+ ┃ ┣ 📄 requirements.txt
+ ┃ ┗ 📄 Dockerfile
+ ┣ 📂 servico-externo/
+ ┃ ┣ 📄 main.py            ← Simula sucesso, lentidão e falha
+ ┃ ┣ 📄 requirements.txt
+ ┃ ┗ 📄 Dockerfile
+ ┣ 📂 monitoramento/
+ ┃ ┣ 📄 prometheus.yml
+ ┃ ┗ 📂 grafana/provisioning/
+ ┃   ┣ 📂 datasources/datasource.yml
+ ┃   ┗ 📂 dashboards/dashboard.yml
  ┣ 📄 docker-compose.yml
  ┗ 📄 README.md
 ```

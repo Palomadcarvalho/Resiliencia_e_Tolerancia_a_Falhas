@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+
+  servico-externo:
+    build: ./servico-externo
+    container_name: servico-externo
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  api-principal:
+    build: ./api-principal
+    container_name: api-principal
+    ports:
+      - "8000:8000"
+    depends_on:
+      servico-externo:
+        condition: service_healthy
+    environment:
+      - SERVICO_EXTERNO_URL=http://servico-externo:8001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoramento/prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - api-principal
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+    volumes:
+      - ./monitoramento/grafana/provisioning:/etc/grafana/provisioning
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  grafana-data:
