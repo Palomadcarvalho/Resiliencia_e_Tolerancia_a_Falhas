@@ -2,7 +2,7 @@ import httpx
 import asyncio
 import logging
 import pybreaker
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -18,6 +18,14 @@ app = FastAPI(title="API Principal - Matrícula Acadêmica")
 
 SERVICO_EXTERNO = "http://servico-externo:8001"
 TIMEOUT_SEGUNDOS = 5
+
+# Cliente HTTP global para otimizar pool de conexões (Connection Pooling).
+# Configura Timeout total e Timeout específico de conexão.
+http_client = httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_SEGUNDOS, connect=2.0))
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await http_client.aclose()
 
 # ─── Métricas Prometheus
 requisicoes_total = Counter(
@@ -65,23 +73,33 @@ def antes_de_retry(retry_state):
         tentativas_retry.inc()
         logger.info(f"🔄 Retry {retry_state.attempt_number - 1}/2 — aguardando backoff...")
 
+def deve_fazer_retry(exception: BaseException) -> bool:
+    """Determina se o erro ocorrido permite uma nova tentativa (Retry)."""
+    if isinstance(exception, httpx.TimeoutException):
+        return True  # Retentar sempre em caso de Timeout
+    if isinstance(exception, httpx.HTTPStatusError):
+        # Retentar apenas se for um erro do servidor (5xx)
+        # Erros do cliente (4xx) não são corrigidos com retries
+        return exception.response.status_code >= 500
+    return False
+
 @retry(
     reraise=True,
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=4),  # 1s → 2s → 4s
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.HTTPStatusError)),
+    retry=retry_if_exception(deve_fazer_retry),
     before=antes_de_retry,
 )
 async def chamar_servico(cpf: str, modo: str) -> dict:
     logger.info(f"Chamando serviço externo — CPF: {cpf} | modo: {modo}")
 
-    async with httpx.AsyncClient(timeout=TIMEOUT_SEGUNDOS) as client:
-        response = await client.get(
-            f"{SERVICO_EXTERNO}/validar-cpf/{modo}/{cpf}"
-        )
-        response.raise_for_status()
-        logger.info("Serviço externo respondeu com sucesso.")
-        return response.json()
+    # Usa o http_client global (com connection pool ativo)
+    response = await http_client.get(
+        f"{SERVICO_EXTERNO}/validar-cpf/{modo}/{cpf}"
+    )
+    response.raise_for_status()
+    logger.info("Serviço externo respondeu com sucesso.")
+    return response.json()
 
 async def chamar_com_circuit_breaker(cpf: str, modo: str) -> dict:
     try:
