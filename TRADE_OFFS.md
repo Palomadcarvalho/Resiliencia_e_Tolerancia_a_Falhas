@@ -44,3 +44,44 @@ Além do limite total de 5 segundos, há um limite específico de 2 segundos par
 
 ### Resumo Arquitetural
 Na prática, o Timeout e o Retry operam em conjunto como uma defesa em camadas. O Timeout garante um teto de espera para proteger o sistema principal (falhando rápido). Imediatamente depois, o Retry com Backoff confere resiliência lidando com as falhas rápidas por meio de novas tentativas espaçadas, garantindo que os componentes da arquitetura não sejam sobrecarregados.
+
+---
+
+## 3. Fallback
+
+**Implementação Técnica**
+Quando o Retry esgota as tentativas e a integração com o serviço externo ainda falha, a aplicação não devolve um erro bruto para o usuário. Em vez disso, ela retorna uma resposta alternativa com o status `matricula_pendente`, indicando que a operação principal foi registrada, mas a validação do CPF não pôde ser concluída no momento.
+
+No código, o fallback é acionado em dois cenários: quando as tentativas falham completamente e quando o circuit breaker já está aberto e bloqueia novas chamadas para o serviço externo.
+
+### Trade-offs do Fallback
+
+**Vantagens:**
+- **Experiência Controlada:** O usuário recebe uma resposta compreensível e estável, mesmo quando a dependência externa falha.
+- **Continuidade do Negócio:** A operação principal segue adiante com estado pendente, evitando que uma falha externa pare completamente o fluxo da API.
+
+**Desvantagens e Riscos:**
+- **Consistência Diferida:** A validação real não acontece imediatamente, então é necessário um mecanismo posterior para concluir a operação pendente.
+- **Risco de Mascarar Problemas:** Se o fallback for usado com muita frequência, ele pode esconder uma degradação sistêmica que deveria ser investigada com prioridade.
+
+---
+
+## 4. Circuit Breaker
+
+**Implementação Técnica**
+O circuit breaker evita que a aplicação continue insistindo em uma dependência que já demonstrou instabilidade. Depois de um número definido de falhas consecutivas, o circuito abre e passa a rejeitar novas chamadas por um período de tempo. Nesse intervalo, a aplicação responde rapidamente sem gastar tempo tentando acessar o serviço externo repetidamente.
+
+No retorno à metade do tempo de abertura, o circuito entra em estado half-open para testar se a dependência se recuperou. Se a chamada de teste funcionar, ele volta para closed; se falhar, abre novamente.
+
+### Trade-offs do Circuit Breaker
+
+**Vantagens:**
+- **Redução de Latência em Cascata:** Evita que várias requisições fiquem presas aguardando timeout quando a dependência já está claramente indisponível.
+- **Proteção da Aplicação Principal:** Impede que uma falha externa consuma recursos do sistema e degrade os demais fluxos.
+
+**Desvantagens e Riscos:**
+- **Falsos Positivos:** Se o limite de abertura for agressivo demais, o circuito pode abrir mesmo para falhas transitórias curtas.
+- **Estado Local:** Nesta implementação, o estado fica em memória, então ele vale apenas para uma instância do serviço. Em produção, isso deveria ser compartilhado em um armazenamento externo, como Redis.
+
+### Resumo Arquitetural
+O Fallback e o Circuit Breaker trabalham juntos. O circuit breaker impede novas tentativas quando a dependência já está degradada; o fallback garante que, mesmo assim, o usuário receba uma resposta controlada. A combinação reduz latência, melhora a experiência do usuário e evita desperdício de recursos durante falhas persistentes.

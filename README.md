@@ -56,14 +56,14 @@ Limite de **5 segundos por tentativa** configurado via `httpx`. Se o serviço ex
 **Trade-offs:** Timeout muito curto descarta respostas válidas em serviços naturalmente lentos; muito longo torna o circuit breaker ineficaz.
 
 ### 🔀 Fallback
-Quando todas as tentativas de retry falham, a API retorna **HTTP 200 com status `matricula_pendente`**, informando que a validação do CPF será realizada posteriormente. O usuário nunca recebe um erro 500 bruto.
+Quando todas as tentativas de retry falham, a API retorna uma resposta controlada com **status `matricula_pendente`**, informando que a validação do CPF será realizada posteriormente. Em falhas persistentes, o usuário não recebe um erro 500 bruto sem contexto.
 
 **Trade-offs:** Exige um mecanismo complementar (fila, job agendado) para processar as pendências; a resposta deve ser honesta sobre o estado real.
 
 ### 🔌 Circuit Breaker
 Implementado com `pybreaker`, opera em **três estados**:
 - **CLOSED:** operação normal — chamadas passam normalmente.
-- **OPEN:** após 5 falhas consecutivas — chamadas bloqueadas, fallback imediato.
+- **OPEN:** após 5 falhas consecutivas — chamadas bloqueadas rapidamente e respondidas de forma controlada, sem nova tentativa ao serviço externo.
 - **HALF-OPEN:** após 30 segundos — uma chamada de teste é permitida para verificar recuperação.
 
 **Trade-offs:** Estado em memória não é compartilhado entre múltiplas instâncias (para produção, usar Redis); requer ajuste fino dos limiares de abertura.
@@ -109,7 +109,7 @@ As seguintes situações podem ser simuladas para demonstrar o comportamento res
 | 🐢 Lentidão | `POST /matricula/{cpf}?modo=lento` | Timeout (5s) → Retry 3x com backoff → Fallback |
 | ❌ Falha total | `POST /matricula/{cpf}?modo=falha` | Retry 3x → Fallback com matrícula pendente |
 | 🔁 Retry | Qualquer `modo=falha` ou `modo=lento` | Logs evidenciam 3 tentativas com intervalos crescentes |
-| 🔌 Circuit Breaker aberto | 5+ chamadas com `modo=falha` | Requisições bloqueadas sem chamar o serviço (HTTP 503) |
+| 🔌 Circuit Breaker aberto | 5+ chamadas com `modo=falha` | Requisições bloqueadas sem chamar o serviço externo e com resposta controlada |
 | 🔒 Bulkhead | 10+ requisições simultâneas | Excedente recebe HTTP 429 imediatamente |
 
 ### Comandos de teste prontos
