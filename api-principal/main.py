@@ -156,9 +156,13 @@ async def realizar_matricula(cpf: str, modo: str = "sucesso"):
 
             except pybreaker.CircuitBreakerError:
                 # Circuit Breaker OPEN → fallback imediato
+                # HTTP 200 (não 503): fallback é tratamento controlado de erro.
+                # O usuário recebe uma resposta válida (matrícula pendente),
+                # nunca um erro técnico bruto. Mesmo padrão do fallback por
+                # retries esgotados — coerente com o documento de trade-offs.
                 dados = resposta_fallback(cpf, "circuit_breaker_aberto")
                 requisicoes_total.labels(status="circuit_breaker").inc()
-                return JSONResponse(status_code=503, content={
+                return JSONResponse(status_code=200, content={
                     "status": "matricula_pendente",
                     "validacao_cpf": dados,
                 })
