@@ -2,6 +2,7 @@ import httpx
 import asyncio
 import logging
 import pybreaker
+from concurrent.futures import ThreadPoolExecutor
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -19,13 +20,21 @@ app = FastAPI(title="API Principal - Matrícula Acadêmica")
 SERVICO_EXTERNO = "http://servico-externo:8001"
 TIMEOUT_SEGUNDOS = 5
 
-# Cliente HTTP global para otimizar pool de conexões (Connection Pooling).
-# Configura Timeout total e Timeout específico de conexão.
-http_client = httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT_SEGUNDOS, connect=2.0))
+# Cliente HTTP SÍNCRONO global, thread-safe, com pool de conexões.
+# pybreaker e tenacity são bibliotecas síncronas; usar um cliente sync
+# elimina o conflito de event loop que existia ao embrulhar httpx.AsyncClient
+# em asyncio.run (cada chamada criava/fechava um loop e prendia o pool a um
+# loop morto → RuntimeError intermitente → fallback indevido).
+http_client = httpx.Client(timeout=httpx.Timeout(TIMEOUT_SEGUNDOS, connect=2.0))
+
+# Pool de threads dedicado às chamadas (síncronas) ao serviço externo.
+# Dimensionado igual ao bulkhead (10) para não criar gargalo nem starvation.
+executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="svc-externo")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    await http_client.aclose()
+    http_client.close()
+    executor.shutdown(wait=False)
 
 # ─── Métricas Prometheus
 requisicoes_total = Counter(
@@ -83,6 +92,10 @@ def deve_fazer_retry(exception: BaseException) -> bool:
         return exception.response.status_code >= 500
     return False
 
+# Ordem dos decorators (de fora para dentro): @cb envolve @retry.
+# Assim o circuit breaker enxerga a operação inteira como UMA chamada e
+# conta 1 falha por requisição, mesmo que internamente tenha havido 3 retries.
+@cb
 @retry(
     reraise=True,
     stop=stop_after_attempt(3),
@@ -90,11 +103,11 @@ def deve_fazer_retry(exception: BaseException) -> bool:
     retry=retry_if_exception(deve_fazer_retry),
     before=antes_de_retry,
 )
-async def chamar_servico(cpf: str, modo: str) -> dict:
+def chamar_servico(cpf: str, modo: str) -> dict:
     logger.info(f"Chamando serviço externo — CPF: {cpf} | modo: {modo}")
 
-    # Usa o http_client global (com connection pool ativo)
-    response = await http_client.get(
+    # Usa o http_client global síncrono (com connection pool ativo)
+    response = http_client.get(
         f"{SERVICO_EXTERNO}/validar-cpf/{modo}/{cpf}"
     )
     response.raise_for_status()
@@ -102,16 +115,11 @@ async def chamar_servico(cpf: str, modo: str) -> dict:
     return response.json()
 
 async def chamar_com_circuit_breaker(cpf: str, modo: str) -> dict:
-    try:
-        loop = asyncio.get_event_loop()
-        resultado = await loop.run_in_executor(
-            None,
-            lambda: cb.call(asyncio.run, chamar_servico(cpf, modo))
-        )
-        return resultado
-    except pybreaker.CircuitBreakerError:
-        logger.warning("🚫 Circuit Breaker OPEN — requisição bloqueada.")
-        raise
+    # chamar_servico é síncrono (pybreaker + tenacity são sync). Rodamos no
+    # pool de threads para não bloquear o event loop do FastAPI. Se o breaker
+    # estiver OPEN, cb levanta CircuitBreakerError, que se propaga pelo await.
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(executor, chamar_servico, cpf, modo)
 
 def resposta_fallback(cpf: str, motivo: str) -> dict:
     logger.warning(f"Fallback ativado — motivo: {motivo}")
@@ -157,9 +165,7 @@ async def realizar_matricula(cpf: str, modo: str = "sucesso"):
             except pybreaker.CircuitBreakerError:
                 # Circuit Breaker OPEN → fallback imediato
                 # HTTP 200 (não 503): fallback é tratamento controlado de erro.
-                # O usuário recebe uma resposta válida (matrícula pendente),
-                # nunca um erro técnico bruto. Mesmo padrão do fallback por
-                # retries esgotados — coerente com o documento de trade-offs.
+                # usuário recebe matrícula pendente
                 dados = resposta_fallback(cpf, "circuit_breaker_aberto")
                 requisicoes_total.labels(status="circuit_breaker").inc()
                 return JSONResponse(status_code=200, content={
@@ -191,8 +197,9 @@ async def status_circuit_breaker():
 @app.post("/circuit-breaker/resetar")
 async def resetar_circuit_breaker():
     """Reseta manualmente o circuit breaker (útil para demonstração)."""
-    cb._state_storage._state = pybreaker.STATE_CLOSED
-    cb._state_storage._failure_count = 0
+    # close() é a API pública do pybreaker: volta ao estado CLOSED e zera o
+    # contador de falhas consecutivas (fail_counter) de forma consistente.
+    cb.close()
     logger.info("🔁 Circuit breaker resetado manualmente.")
     return {"mensagem": "Circuit breaker resetado para CLOSED."}
 
